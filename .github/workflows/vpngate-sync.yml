@@ -1,0 +1,83 @@
+name: vpngate-sync
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: vpngate-sync
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet firebase-admin
+
+      - name: Push VPN Gate list to Firestore
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          python - <<'PY'
+          import json, os, sys, urllib.request
+          import firebase_admin
+          from firebase_admin import credentials, firestore
+
+          URL = "https://www.vpngate.net/api/iphone/"
+          COLLECTION = "vpngate_list"
+          CHUNK_BYTES = 700_000
+
+          key = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+          if not key:
+              sys.exit("FIREBASE_SERVICE_ACCOUNT is not set")
+
+          req = urllib.request.Request(URL, headers={"User-Agent": "curl/8.5.0"})
+          with urllib.request.urlopen(req, timeout=90) as r:
+              raw = r.read().decode("utf-8", "replace")
+          if not raw.lstrip().startswith("*vpn_servers"):
+              sys.exit("unexpected body: %r" % raw[:200])
+          if raw.count("\n") < 50:
+              sys.exit("too few lines: %d" % raw.count("\n"))
+
+          parts, cur, size = [], [], 0
+          for line in raw.splitlines(keepends=True):
+              n = len(line.encode("utf-8"))
+              if size + n > CHUNK_BYTES and cur:
+                  parts.append("".join(cur))
+                  cur, size = [], 0
+              cur.append(line)
+              size += n
+          if cur:
+              parts.append("".join(cur))
+
+          firebase_admin.initialize_app(credentials.Certificate(json.loads(key)))
+          db = firestore.client()
+          col = db.collection(COLLECTION)
+
+          meta = col.document("meta").get()
+          old = meta.to_dict().get("chunkCount", 0) if meta.exists else 0
+
+          batch = db.batch()
+          for i, part in enumerate(parts):
+              batch.set(col.document("chunk_%d" % i), {"data": part})
+          batch.set(col.document("meta"), {
+              "chunkCount": len(parts),
+              "bytes": len(raw.encode("utf-8")),
+              "updatedAt": firestore.SERVER_TIMESTAMP,
+          })
+          batch.commit()
+
+          for i in range(len(parts), old):
+              col.document("chunk_%d" % i).delete()
+
+          rows = sum(1 for x in raw.splitlines()
+                     if x and not x.startswith("*") and not x.startswith("#"))
+          print("rows=%d chunks=%d bytes=%d stale_deleted=%d"
+                % (rows, len(parts), len(raw.encode("utf-8")), max(0, old - len(parts))))
+          PY
