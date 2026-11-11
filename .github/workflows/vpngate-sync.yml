@@ -25,12 +25,13 @@ jobs:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
         run: |
           python - <<'PY'
-          import json, os, sys, urllib.request
+          import base64, json, os, re, sys, urllib.request
           import firebase_admin
           from firebase_admin import credentials, firestore
 
           URL = "https://www.vpngate.net/api/iphone/"
-          COLLECTION = "vpngate_list"
+          COLLECTION = "vpngate_list"        # eski uygulama sürümleri (tam CSV, 1.3 MB)
+          COMPACT = "vpngate_list_v2"        # yeni sürüm: tek belge, yalnızca gereken alanlar
           CHUNK_BYTES = 700_000
 
           key = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
@@ -75,6 +76,38 @@ jobs:
 
           for i in range(len(parts), old):
               col.document("chunk_%d" % i).delete()
+
+          # --- v2: uygulamanın kullandığı alanlar, sekmeyle ayrılmış, tek belge ---
+          # Satır: ip, port, ülke kodu, ülke, hız (bps), oturum, çalışma süresi (ms).
+          # Port CSV'de yok; OpenVPN config'indeki `remote <ip> <port>` satırından.
+          # Tek belge = tek okuma: parçalar arası yarım okuma olmaz, ~50x küçük.
+          remote = re.compile(r"^[ \t]*remote[ \t]+\S+[ \t]+(\d+)", re.M)
+          out = ["v2"]
+          for line in raw.splitlines():
+              if not line or line[0] in "*#":
+                  continue
+              rec = line.split(",")
+              if len(rec) < 15 or not rec[14].strip():
+                  continue
+              try:
+                  b64 = rec[14].strip()
+                  cfg = base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode("utf-8", "replace")
+              except Exception:
+                  continue
+              m = remote.search(cfg)
+              if not m:
+                  continue
+              f = [rec[1], m.group(1), rec[6], rec[5], rec[4], rec[7], rec[8]]
+              out.append("\t".join(x.strip().replace("\t", " ") for x in f))
+          if len(out) < 20:
+              sys.exit("compact list too small: %d" % (len(out) - 1))
+          compact = "\n".join(out) + "\n"
+          db.collection(COMPACT).document("list").set({
+              "data": compact,
+              "count": len(out) - 1,
+              "updatedAt": firestore.SERVER_TIMESTAMP,
+          })
+          print("v2 rows=%d bytes=%d" % (len(out) - 1, len(compact.encode("utf-8"))))
 
           rows = sum(1 for x in raw.splitlines()
                      if x and not x.startswith("*") and not x.startswith("#"))
