@@ -1,0 +1,67 @@
+name: app-release
+
+# GitHub'da bir sürüm (Release) yayınlanınca, ekli APK'nın indirme adresini
+# Firestore `app_release/latest` belgesine yazar. Uygulama açılışta bu belgeye
+# bakıp yeni sürüm varsa ana ekranda "Yeni sürüm — İndir" kartı gösterir.
+#
+# APK adı ŞART: openworld-<versionName>-<versionCode>.apk
+#   örn. openworld-2.1.0-101.apk  (openworld/tool/release.sh böyle üretir)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: app-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet firebase-admin
+
+      - name: Write latest release to Firestore
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import json, os, re, sys, urllib.request
+          import firebase_admin
+          from firebase_admin import credentials, firestore
+
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{os.environ['REPO']}/releases/latest",
+              headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                       "Accept": "application/vnd.github+json"})
+          rel = json.load(urllib.request.urlopen(req, timeout=30))
+
+          pat = re.compile(r"^openworld-([0-9][0-9A-Za-z.\-]*)-(\d+)\.apk$")
+          apk = None
+          for a in rel.get("assets", []):
+              m = pat.match(a["name"])
+              if m:
+                  apk = (a, m.group(1), int(m.group(2)))
+                  break
+          if not apk:
+              sys.exit("no asset named openworld-<versionName>-<versionCode>.apk in latest release")
+          asset, version_name, version_code = apk
+
+          firebase_admin.initialize_app(credentials.Certificate(json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"])))
+          firestore.client().collection("app_release").document("latest").set({
+              "versionCode": version_code,
+              "versionName": version_name,
+              "url": asset["browser_download_url"],
+              "page": rel["html_url"],
+              "updatedAt": firestore.SERVER_TIMESTAMP,
+          })
+          print(f"latest = {version_name} ({version_code}) {asset['browser_download_url']}")
+          PY
