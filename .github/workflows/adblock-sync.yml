@@ -1,7 +1,7 @@
 name: adblock-sync
 
-# Reklam engelleme listesini günde bir kez üretip Firestore'a (`adblock_list`)
-# yazar; uygulama Wi-Fi'dayken günde en fazla bir kez yenisini indirir.
+# Reklam engelleme listesini haftada bir üretip Firestore'a (`adblock_list`)
+# yazar; uygulama Wi-Fi'dayken haftada en fazla bir kez yenisini indirir.
 #
 # Kaynaklar YALNIZCA yeniden dağıtıma izin veren lisanslı listeler — ayrıntı ve
 # gerekçe: openworld/tool/build_adblock.py (bu iş onun aynısını yapıyor; biri
@@ -9,7 +9,7 @@ name: adblock-sync
 
 on:
   schedule:
-    - cron: "23 3 * * *"
+    - cron: "23 3 * * 1"   # haftalık (pazartesi) — uygulama da haftada bir bakıyor
   workflow_dispatch:
 
 concurrency:
@@ -38,6 +38,8 @@ jobs:
 
           BASE = "https://raw.githubusercontent.com/StevenBlack/hosts/master/data"
           SOURCES = ["adaway.org", "StevenBlack", "add.2o7Net", "UncheckyAds"]
+          ONEHOSTS = "https://raw.githubusercontent.com/badmojr/1Hosts/master/Lite/domains.txt"  # MPL-2.0
+          EXTRA = {"creative.cdnyeah.com", "ali-vg-track.algogear.com", "ad-notice-aws.falconnet.app"}
           ALLOW = {"firestore.googleapis.com", "firebasecrashlyticssymbols.googleapis.com",
                    "crashlyticsreports-pa.googleapis.com", "localhost"}
           HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
@@ -67,8 +69,21 @@ jobs:
               if count < 5:
                   sys.exit(f"{name}: too few domains ({count}) — source changed?")
 
+          req = urllib.request.Request(ONEHOSTS, headers={"User-Agent": "curl/8.5.0"})
+          with urllib.request.urlopen(req, timeout=90) as r:
+              text = r.read().decode("utf-8", "replace")
+          count = 0
+          for line in text.splitlines():
+              host = line.split("#", 1)[0].strip().lower().rstrip(".")
+              if host and host not in ALLOW and HOST_RE.match(host):
+                  domains.add(host)
+                  count += 1
+          if count < 50000:
+              sys.exit(f"1Hosts Lite: too few domains ({count}) — source changed?")
+          domains |= EXTRA
+
           # Uygulama 1000'den küçük listeyi bozuk sayıp reddediyor; burada da dur.
-          if len(domains) < 5000:
+          if len(domains) < 100000:
               sys.exit(f"too few domains overall: {len(domains)}")
 
           raw = ("\n".join(sorted(domains)) + "\n").encode()
