@@ -41,6 +41,138 @@ jobs:
           PLAIN = ["https://raw.githubusercontent.com/badmojr/1Hosts/master/Lite/domains.txt",
                    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt"]
           ADBLOCK = ["https://raw.githubusercontent.com/froggeric/DNS-blocklists/main/NoYouTubeAdsDNS"]
+          EXTRA = {"creative.cdnyeah.com", "ali-vg-track.algogear.com", "ad-notice-aws.falconnet.app",
+                   "adxbid.bmtcad.com", "jp.matk.temu.com", "sdkserver-dra.op.dbankcloud.com", "commvod.kwcdn.com"}
+          ALLOW = {"firestore.googleapis.com", "firebasecrashlyticssymbols.googleapis.com",
+                   "crashlyticsreports-pa.googleapis.com", "localhost"}
+          HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+          COLLECTION = "adblock_list"
+          CHUNK_CHARS = 700_000
+
+          key = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+          if not key:
+              sys.exit("FIREBASE_SERVICE_ACCOUNT is not set")
+
+          domains = set()
+          for name in SOURCES:
+              req = urllib.request.Request(f"{BASE}/{name}/hosts", headers={"User-Agent": "curl/8.5.0"})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  text = r.read().decode("utf-8", "replace")
+              count = 0
+              for line in text.splitlines():
+                  parts = line.split("#", 1)[0].split()
+                  if len(parts) < 2 or parts[0] not in ("0.0.0.0", "127.0.0.1"):
+                      continue
+                  for host in parts[1:]:
+                      host = host.lower().rstrip(".")
+                      if host in ALLOW or not HOST_RE.match(host):
+                          continue
+                      domains.add(host)
+                      count += 1
+              if count < 5:
+                  sys.exit(f"{name}: too few domains ({count}) — source changed?")
+
+          def get(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0"})
+              with urllib.request.urlopen(req, timeout=90) as r:
+                  return r.read().decode("utf-8", "replace")
+
+          for url in PLAIN:
+              count = 0
+              for line in get(url).splitlines():
+                  host = line.split("#", 1)[0].strip().lower().rstrip(".")
+                  if host and host not in ALLOW and HOST_RE.match(host):
+                      domains.add(host)
+                      count += 1
+              if count < 50000:
+                  sys.exit(f"{url}: too few domains ({count})")
+
+          for url in ADBLOCK:
+              count = 0
+              for line in get(url).splitlines():
+                  line = line.strip()
+                  if line.startswith("||") and line.endswith("^"):
+                      host = line[2:-1].lower().rstrip(".")
+                      if host not in ALLOW and HOST_RE.match(host):
+                          domains.add(host)
+                          count += 1
+              if count < 20:
+                  sys.exit(f"{url}: too few domains ({count})")
+          domains |= EXTRA
+
+          # Uygulama 1000'den küçük listeyi bozuk sayıp reddediyor; burada da dur.
+          if len(domains) < 250000:
+              sys.exit(f"too few domains overall: {len(domains)}")
+
+          raw = ("\n".join(sorted(domains)) + "\n").encode()
+          payload = base64.b64encode(gzip.compress(raw, compresslevel=9, mtime=0)).decode()
+          parts = [payload[i:i + CHUNK_CHARS] for i in range(0, len(payload), CHUNK_CHARS)]
+
+          firebase_admin.initialize_app(credentials.Certificate(json.loads(key)))
+          db = firestore.client()
+          col = db.collection(COLLECTION)
+
+          meta = col.document("meta").get()
+          old = meta.to_dict().get("chunkCount", 0) if meta.exists else 0
+
+          batch = db.batch()
+          for i, part in enumerate(parts):
+              batch.set(col.document("chunk_%d" % i), {"data": part})
+          batch.set(col.document("meta"), {
+              "chunkCount": len(parts),
+              "domains": len(domains),
+              "updatedAt": firestore.SERVER_TIMESTAMP,
+          })
+          batch.commit()
+
+          for i in range(len(parts), old):
+              col.document("chunk_%d" % i).delete()
+
+          print("domains=%d chunks=%d bytes=%d" % (len(domains), len(parts), len(payload)))
+          PY
+name: adblock-sync
+
+# Reklam engelleme listesini haftada bir üretip Firestore'a (`adblock_list`)
+# yazar; uygulama Wi-Fi'dayken haftada en fazla bir kez yenisini indirir.
+#
+# Kaynaklar YALNIZCA yeniden dağıtıma izin veren lisanslı listeler — ayrıntı ve
+# gerekçe: openworld/tool/build_adblock.py (bu iş onun aynısını yapıyor; biri
+# değişirse diğeri de değişmeli) ve app/src/main/assets/adblock-NOTICE.txt.
+
+on:
+  schedule:
+    - cron: "23 3 * * 1"   # haftalık (pazartesi) — uygulama da haftada bir bakıyor
+  workflow_dispatch:
+
+concurrency:
+  group: adblock-sync
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet firebase-admin
+
+      - name: Build list and push to Firestore
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          python - <<'PY'
+          import base64, gzip, json, os, re, sys, urllib.request
+          import firebase_admin
+          from firebase_admin import credentials, firestore
+
+          BASE = "https://raw.githubusercontent.com/StevenBlack/hosts/master/data"
+          SOURCES = ["adaway.org", "StevenBlack", "add.2o7Net", "UncheckyAds"]
+          PLAIN = ["https://raw.githubusercontent.com/badmojr/1Hosts/master/Lite/domains.txt",
+                   "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt"]
+          ADBLOCK = ["https://raw.githubusercontent.com/froggeric/DNS-blocklists/main/NoYouTubeAdsDNS"]
           EXTRA = {"creative.cdnyeah.com", "ali-vg-track.algogear.com", "ad-notice-aws.falconnet.app"}
           ALLOW = {"firestore.googleapis.com", "firebasecrashlyticssymbols.googleapis.com",
                    "crashlyticsreports-pa.googleapis.com", "localhost"}
