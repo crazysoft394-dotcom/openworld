@@ -30,9 +30,8 @@ jobs:
           from firebase_admin import credentials, firestore
 
           URL = "https://www.vpngate.net/api/iphone/"
-          COLLECTION = "vpngate_list"        # eski uygulama sürümleri (tam CSV, 1.3 MB)
-          COMPACT = "vpngate_list_v2"        # yeni sürüm: tek belge, yalnızca gereken alanlar
-          CHUNK_BYTES = 700_000
+          COLLECTION = "vpngate_list_v2"   # tek belge: list
+          LEGACY = "vpngate_list"          # eski tam CSV (1.3 MB) — artık yazılmıyor, kalıntısı silinir
 
           key = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
           if not key:
@@ -46,41 +45,10 @@ jobs:
           if raw.count("\n") < 50:
               sys.exit("too few lines: %d" % raw.count("\n"))
 
-          parts, cur, size = [], [], 0
-          for line in raw.splitlines(keepends=True):
-              n = len(line.encode("utf-8"))
-              if size + n > CHUNK_BYTES and cur:
-                  parts.append("".join(cur))
-                  cur, size = [], 0
-              cur.append(line)
-              size += n
-          if cur:
-              parts.append("".join(cur))
-
-          firebase_admin.initialize_app(credentials.Certificate(json.loads(key)))
-          db = firestore.client()
-          col = db.collection(COLLECTION)
-
-          meta = col.document("meta").get()
-          old = meta.to_dict().get("chunkCount", 0) if meta.exists else 0
-
-          batch = db.batch()
-          for i, part in enumerate(parts):
-              batch.set(col.document("chunk_%d" % i), {"data": part})
-          batch.set(col.document("meta"), {
-              "chunkCount": len(parts),
-              "bytes": len(raw.encode("utf-8")),
-              "updatedAt": firestore.SERVER_TIMESTAMP,
-          })
-          batch.commit()
-
-          for i in range(len(parts), old):
-              col.document("chunk_%d" % i).delete()
-
-          # --- v2: uygulamanın kullandığı alanlar, sekmeyle ayrılmış, tek belge ---
+          # Uygulamanın kullandığı alanlar, sekmeyle ayrılmış, ilk satır "v2".
           # Satır: ip, port, ülke kodu, ülke, hız (bps), oturum, çalışma süresi (ms).
           # Port CSV'de yok; OpenVPN config'indeki `remote <ip> <port>` satırından.
-          # Tek belge = tek okuma: parçalar arası yarım okuma olmaz, ~50x küçük.
+          # Tek belge = tek okuma: yarım okuma olmaz, tam CSV'den ~200x küçük.
           remote = re.compile(r"^[ \t]*remote[ \t]+\S+[ \t]+(\d+)", re.M)
           out = ["v2"]
           for line in raw.splitlines():
@@ -100,17 +68,21 @@ jobs:
               f = [rec[1], m.group(1), rec[6], rec[5], rec[4], rec[7], rec[8]]
               out.append("\t".join(x.strip().replace("\t", " ") for x in f))
           if len(out) < 20:
-              sys.exit("compact list too small: %d" % (len(out) - 1))
+              sys.exit("list too small: %d" % (len(out) - 1))
           compact = "\n".join(out) + "\n"
-          db.collection(COMPACT).document("list").set({
+
+          firebase_admin.initialize_app(credentials.Certificate(json.loads(key)))
+          db = firestore.client()
+          db.collection(COLLECTION).document("list").set({
               "data": compact,
               "count": len(out) - 1,
               "updatedAt": firestore.SERVER_TIMESTAMP,
           })
-          print("v2 rows=%d bytes=%d" % (len(out) - 1, len(compact.encode("utf-8"))))
 
-          rows = sum(1 for x in raw.splitlines()
-                     if x and not x.startswith("*") and not x.startswith("#"))
-          print("rows=%d chunks=%d bytes=%d stale_deleted=%d"
-                % (rows, len(parts), len(raw.encode("utf-8")), max(0, old - len(parts))))
+          stale = 0
+          for doc in db.collection(LEGACY).list_documents():
+              doc.delete()
+              stale += 1
+
+          print("rows=%d bytes=%d legacy_deleted=%d" % (len(out) - 1, len(compact.encode("utf-8")), stale))
           PY
