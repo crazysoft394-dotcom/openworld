@@ -38,7 +38,9 @@ jobs:
 
           BASE = "https://raw.githubusercontent.com/StevenBlack/hosts/master/data"
           SOURCES = ["adaway.org", "StevenBlack", "add.2o7Net", "UncheckyAds"]
-          ONEHOSTS = "https://raw.githubusercontent.com/badmojr/1Hosts/master/Lite/domains.txt"  # MPL-2.0
+          PLAIN = ["https://raw.githubusercontent.com/badmojr/1Hosts/master/Lite/domains.txt",
+                   "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt"]
+          ADBLOCK = ["https://raw.githubusercontent.com/froggeric/DNS-blocklists/main/NoYouTubeAdsDNS"]
           EXTRA = {"creative.cdnyeah.com", "ali-vg-track.algogear.com", "ad-notice-aws.falconnet.app"}
           ALLOW = {"firestore.googleapis.com", "firebasecrashlyticssymbols.googleapis.com",
                    "crashlyticsreports-pa.googleapis.com", "localhost"}
@@ -69,21 +71,36 @@ jobs:
               if count < 5:
                   sys.exit(f"{name}: too few domains ({count}) — source changed?")
 
-          req = urllib.request.Request(ONEHOSTS, headers={"User-Agent": "curl/8.5.0"})
-          with urllib.request.urlopen(req, timeout=90) as r:
-              text = r.read().decode("utf-8", "replace")
-          count = 0
-          for line in text.splitlines():
-              host = line.split("#", 1)[0].strip().lower().rstrip(".")
-              if host and host not in ALLOW and HOST_RE.match(host):
-                  domains.add(host)
-                  count += 1
-          if count < 50000:
-              sys.exit(f"1Hosts Lite: too few domains ({count}) — source changed?")
+          def get(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0"})
+              with urllib.request.urlopen(req, timeout=90) as r:
+                  return r.read().decode("utf-8", "replace")
+
+          for url in PLAIN:
+              count = 0
+              for line in get(url).splitlines():
+                  host = line.split("#", 1)[0].strip().lower().rstrip(".")
+                  if host and host not in ALLOW and HOST_RE.match(host):
+                      domains.add(host)
+                      count += 1
+              if count < 50000:
+                  sys.exit(f"{url}: too few domains ({count})")
+
+          for url in ADBLOCK:
+              count = 0
+              for line in get(url).splitlines():
+                  line = line.strip()
+                  if line.startswith("||") and line.endswith("^"):
+                      host = line[2:-1].lower().rstrip(".")
+                      if host not in ALLOW and HOST_RE.match(host):
+                          domains.add(host)
+                          count += 1
+              if count < 20:
+                  sys.exit(f"{url}: too few domains ({count})")
           domains |= EXTRA
 
           # Uygulama 1000'den küçük listeyi bozuk sayıp reddediyor; burada da dur.
-          if len(domains) < 100000:
+          if len(domains) < 250000:
               sys.exit(f"too few domains overall: {len(domains)}")
 
           raw = ("\n".join(sorted(domains)) + "\n").encode()
